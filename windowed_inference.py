@@ -1,11 +1,11 @@
-import argparse
 import torch
 import librosa
 import numpy as np
 from torch import autocast
 from contextlib import nullcontext
 
-from models.mn.model import get_model as get_mobilenet, get_ensemble_model
+from models.mn.model import get_model as get_mobilenet
+from models.ensemble import get_ensemble_model
 from models.preprocess import AugmentMelSTFT
 from helpers.utils import NAME_TO_WIDTH, labels
 
@@ -68,21 +68,17 @@ class EATagger:
         self.mel.to(self.device)
         self.mel.eval()
 
-    def tag_audio_window(self, audio_path, window_size=20.0, hop_length=10.0):
+    def tag_audio_window(self, audio_path, window_size=1.0, hop_length=1.0):
         """
-            Tags an audio file with an acoustic event.
+            Extracts embeddings from audio file and prediction scores for 527 AudioSet classes.
             Args:
                 audio_path (str): path to the audio file
                 window_size (float): size of the window in seconds
                 hop_length (float): hop length in seconds
             Returns:
-                List of dictionaries with the following keys:
-                    - 'start': start time of the window in seconds
-                    - 'end': end time of the window in seconds
-                    - 'tags': list of tags for the window in dictionary format
-                        - 'tag': name of the tag
-                        - 'probability': confidence of the tag
-                
+                Scores - A tensor of n class scores per inference window
+                Features - A tensor of 960 coefficients per inference window
+
         """
 
         # load audio file
@@ -95,54 +91,34 @@ class EATagger:
         n_windows = int(np.ceil((waveform.shape[1] - window_size) / hop_length)) + 1
         waveform = torch.nn.functional.pad(waveform, (0, n_windows * hop_length + window_size - waveform.shape[1]))
 
+        with torch.no_grad(), torch.autocast(
+                device_type=self.device.type) if self.device.type == 'cuda' else nullcontext():
 
-        with torch.no_grad(), autocast(device_type=self.device.type) if self.device.type == 'cuda' else nullcontext():
-            tags = []
+            scores = []
+            feats = []
             for i in range(n_windows):
                 start = i * hop_length
                 end = start + window_size
                 spec = self.mel(waveform[:, start:end])
                 preds, features = self.model(spec.unsqueeze(0))
                 preds = torch.sigmoid(preds.float()).squeeze().cpu().numpy()
-                sorted_indexes = np.argsort(preds)[::-1]
 
-                # Print audio tagging top probabilities
-                tags.append({
-                    'start': start / self.sample_rate,
-                    'end': end / self.sample_rate,
-                    'tags': [{
-                        'tag': labels[sorted_indexes[k]],
-                        'probability': preds[sorted_indexes[k]]
-                    } for k in range(10)]
-                })
+                scores.append(preds)
+                feats.append(features.numpy())
 
-                # progress bar
-                print(f'\rProgress: {i+1}/{n_windows}', end='')
+                print(f'\rProgress: {i + 1}/{n_windows}', end='')
             print()
 
-
-        return tags
+        return scores, feats
         
 
-
 if __name__ == '__main__':
-    parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default='mn10_as', help='model name')
-    parser.add_argument('--cuda', action='store_true', default=False)
-    parser.add_argument('--audio_path', type=str, help='path to the audio file', required=True)
-    parser.add_argument('--window_size', type=float, default=10.0, help='window size in seconds')
-    parser.add_argument('--hop_length', type=float, default=2.5, help='hop length in seconds')
-    args = parser.parse_args()
 
     # load the model
-    model = EATagger(model_name=args.model, device='cuda' if args.cuda else 'cpu')
+    model = EATagger(model_name='mn10_as', device='cpu')
 
-    # tag the audio file
-    tags = model.tag_audio_window(args.audio_path, window_size=args.window_size, hop_length=args.hop_length)
-    
-    # for each window, print the top 5 tags and their probabilities
-    for window in tags:
-        print(f'Window: {window["start"]:.2f} - {window["end"]:.2f}')
-        for tag in window['tags'][:5]:
-            print(f'\t{tag["tag"]}: {tag["probability"]:.2f}')
-        print()
+    # extract scores and features
+    scores, feats = model.tag_audio_window('resources/metro_station-paris.wav', window_size=1.0, hop_length=1.0)
+
+    print(scores[0])
+    print(feats[0])
